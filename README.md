@@ -64,19 +64,6 @@ Our methodology follows these key principles:
 3. **Medical Validation**: Prioritize clinically relevant metrics over pure accuracy
 4. **Accessibility Focus**: Design for deployment in resource-limited settings
 
-##  Repository Structure (Proposed)
-
-Qsight_Project/
-├── docs/ # Documentation & planning
-├── notebooks/ # Experimental notebooks
-│ ├── exploration/ # Data exploration
-│ ├── classical/ # Classical model experiments
-│ └── quantum/ # Quantum integration tests
-├── src/ # Source code (to be developed)
-├── data/ # Dataset storage
-├── requirements.txt # Dependencies
-└── README.md # This file
-
 
 ##  Key Resources
 
