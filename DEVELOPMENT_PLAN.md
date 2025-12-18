@@ -96,7 +96,7 @@ Processing Pipeline: Image Preprocessing → Feature Extraction → ACO Selectio
 ## 📊 **Recommended Datasets (Updated with Links)**
 
 ### **1. APTOS 2019 Blindness Detection** ⭐ **PRIMARY CHOICE**
-**For Hackathon:** This is your **BEST option** - clean, manageable size, well-organized
+
 ```
 Kaggle Link: https://www.kaggle.com/c/aptos2019-blindness-detection
 Size: ~3.6 GB
@@ -126,7 +126,7 @@ Advantages:
 ```
 
 ### **3. Diabetic Retinopathy Resized** ⭐ **LARGER OPTION**
-**Tanlikesmath's Version:** More data if you need it
+**Tanlikesmath's Version:** More data if needed
 ```
 Kaggle Link: https://www.kaggle.com/datasets/tanlikesmath/diabetic-retinopathy-resized
 Size: 8 GB
@@ -139,7 +139,7 @@ Features:
 ```
 
 ### **4. EyePACS (Largest Dataset)**
-**For Reference:** If you want maximum data
+**For Reference:** If we want maximum data
 ```
 Kaggle Link: https://www.kaggle.com/c/diabetic-retinopathy-detection
 Size: 88 GB
@@ -349,19 +349,19 @@ batch_size = 32  # ~6.4 MB per batch
 ## 🎯 **Final Decision Matrix**
 
 ### **Choose SOVITRATH if:**
-- You want fastest startup time
+- We want fastest startup time
 - Need consistent preprocessing
 - Have limited disk space
 - Want to focus on algorithm development vs data engineering
 
 ### **Choose APTOS if:**
-- You want competition-standard dataset
+- We want competition-standard dataset
 - Need to compare with published results
 - Have time for preprocessing
 - Want challenge of handling varied image quality
 
 ### **Choose TANLIKESMATH if:**
-- You have strong internet connection
+- We have strong internet connection
 - Need maximum data for training
 - Have time for 8GB download/processing
 - Want to demonstrate scalability
