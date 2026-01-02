@@ -1,0 +1,71 @@
+{
+  "dataset_root": "/absolute/path/to/datasets/DiabeticRetinopathy/resized_train_cropped",
+  "output_dir": "trained_model",
+  "stages_config": null,
+  "batch_size": 24,
+  "train_ratio": 0.9,
+  "num_workers": 4,
+  "seed": 42,
+  "pretrained": true,
+  "encoder_type": "resnet50",
+  "device": "cuda:0",
+  "grad_clip": 1.0,
+  "mixed_precision": true,
+  "enable_latency_tracking": true,
+  "log_interval": 25,
+  "quantum_enabled": true,
+  "quantum_qubits": 4,
+  "quantum_shots": 1024,
+  "use_weighted_sampler": true,
+  "use_wandb": false,
+  "wandb_project": "qsight-care",
+  "wandb_entity": null,
+  "wandb_run_name": null,
+  "wandb_tags": [
+    "local"
+  ],
+  "wandb_mode": "online",
+  "checkpoint_dir": "trained_model/checkpoints",
+  "multi_gpu": false,
+  "device_ids": [0, 1],
+  "stages": [
+    {
+      "name": "classical",
+      "num_epochs": 25,
+      "learning_rate": 0.005,
+      "patience": 3,
+      "active_mask": [1, 1, 0],
+      "grad_accum_steps": 1,
+      "loss_weights": {
+        "classical_a": 1.0,
+        "classical_b": 1.0,
+        "quantum": 0.0,
+        "ensemble": 0.25
+      }
+    },
+    {
+      "name": "quantum",
+      "num_epochs": 10,
+      "learning_rate": 0.00008,
+      "patience": 3,
+      "active_mask": [0, 0, 1],
+      "grad_accum_steps": 2,
+      "annealing_schedule": {
+        "start_temp": 2.5,
+        "end_temp": 0.6,
+        "start_noise": 0.2,
+        "end_noise": 0.0,
+        "strategy": "cosine"
+      }
+    },
+    {
+      "name": "ensemble",
+      "num_epochs": 12,
+      "learning_rate": 0.001,
+      "grad_accum_steps": 1,
+      "loss_weights": {
+        "ensemble": 1.0
+      }
+    }
+  ]
+}

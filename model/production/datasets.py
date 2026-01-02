@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import csv
 import logging
 import os
 from dataclasses import dataclass
@@ -12,20 +11,35 @@ from typing import Callable, Optional, Sequence, Tuple
 import pandas as pd
 from PIL import Image
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from sklearn.model_selection import train_test_split
 from torchvision import transforms
+import numpy as np
 
 LOGGER = logging.getLogger(__name__)
+
+TANLIKESMATH_CLASS_NAMES: Tuple[str, ...] = (
+    "No DR",
+    "Mild",
+    "Moderate",
+    "Severe",
+    "Proliferative DR",
+)
 
 
 def _default_transform(image_size: int = 224) -> transforms.Compose:
     return transforms.Compose(
         [
-            transforms.Resize((image_size, image_size)),
+            transforms.RandomResizedCrop(image_size, scale=(0.82, 1.0), ratio=(0.9, 1.1)),
             transforms.RandomHorizontalFlip(),
-            transforms.RandomRotation(10),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.RandomVerticalFlip(p=0.1),
+            transforms.RandomApply(
+                [transforms.ColorJitter(brightness=0.25, contrast=0.25, saturation=0.2, hue=0.02)],
+                p=0.6,
+            ),
+            transforms.RandomApply([transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))], p=0.3),
+            transforms.RandomAdjustSharpness(sharpness_factor=1.4, p=0.2),
+            transforms.RandomAffine(degrees=8, translate=(0.02, 0.02), scale=(0.95, 1.05), shear=2),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
@@ -53,6 +67,7 @@ class DatasetConfig:
     seed: int = 42
     transform: Optional[Callable] = None
     val_transform: Optional[Callable] = None
+    use_weighted_sampler: bool = False
 
     def __post_init__(self) -> None:
         self.root = Path(self.root).expanduser().resolve()
@@ -93,6 +108,7 @@ class DiabeticRetinopathyDataset(Dataset):
                 raise ValueError(f"Unsupported dataset type: {config.dataset_type}")
             loader()
 
+        self._compute_class_stats()
         LOGGER.info("Loaded %d samples for %s (%s)", len(self.image_paths), config.dataset_type, mode)
 
     # Loader selection ---------------------------------------------------
@@ -109,12 +125,28 @@ class DiabeticRetinopathyDataset(Dataset):
         self._load_from_directory(base_path, classes)
 
     def _load_tanlikesmath(self) -> None:
-        base_path = self.config.root / "resized_train" / "resized_train"
-        labels_path = self.config.root / "resized_train" / "trainLabels.csv"
-        if not labels_path.exists():
-            raise FileNotFoundError(f"Missing labels CSV: {labels_path}")
+        base_candidates = [
+            self.config.root / "resized_train" / "resized_train",
+            self.config.root / "resized_train",
+        ]
+        base_path = next((path for path in base_candidates if path.exists()), None)
+        if base_path is None:
+            raise FileNotFoundError(
+                "Could not locate image directory. Expected either 'resized_train/resized_train' or 'resized_train' under the dataset root."
+            )
+
+        labels_candidates = [
+            self.config.root / "resized_train" / "trainLabels.csv",
+            self.config.root / "trainLabels.csv",
+        ]
+        labels_path = next((path for path in labels_candidates if path.exists()), None)
+        if labels_path is None:
+            raise FileNotFoundError(
+                "Missing labels CSV. Expected 'trainLabels.csv' inside dataset root or the 'resized_train' directory."
+            )
+
         labels_df = pd.read_csv(labels_path)
-        self.classes = ["0", "1", "2", "3", "4"]
+        self.classes = list(TANLIKESMATH_CLASS_NAMES)
         self.class_to_idx = {cls: idx for idx, cls in enumerate(self.classes)}
         for _, row in labels_df.iterrows():
             img_name = f"{row['image']}.jpeg"
@@ -122,6 +154,8 @@ class DiabeticRetinopathyDataset(Dataset):
             if img_path.exists():
                 self.image_paths.append(img_path)
                 self.labels.append(int(row["level"]))
+            else:
+                LOGGER.debug("Skipping missing image: %s", img_path)
 
     def _load_from_directory(self, base_path: Path, classes: Sequence[str]) -> None:
         self.classes = list(classes)
@@ -141,13 +175,36 @@ class DiabeticRetinopathyDataset(Dataset):
     def __len__(self) -> int:
         return len(self.image_paths)
 
-    def __getitem__(self, index: int) -> Tuple[np.ndarray, int, str]:
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, int, str]:
         img_path = self.image_paths[index]
         label = self.labels[index]
         image = Image.open(img_path).convert("RGB")
         if self.transform:
             image = self.transform(image)
         return image, label, str(img_path)
+
+    def _compute_class_stats(self) -> None:
+        num_classes = len(self.classes)
+        if num_classes == 0:
+            self.class_counts = np.zeros(0, dtype=np.int64)
+            self.class_weights = np.zeros(0, dtype=np.float64)
+            return
+        if not self.labels:
+            self.class_counts = np.zeros(num_classes, dtype=np.int64)
+            self.class_weights = np.ones(num_classes, dtype=np.float64) / max(num_classes, 1)
+            return
+        counts = np.bincount(self.labels, minlength=num_classes).astype(np.int64)
+        self.class_counts = counts
+        total = counts.sum()
+        if total == 0:
+            self.class_weights = np.ones(num_classes, dtype=np.float64) / max(num_classes, 1)
+            return
+        safe_counts = counts.astype(np.float64)
+        zero_mask = safe_counts == 0.0
+        safe_counts[zero_mask] = 1.0
+        weights = (total / num_classes) / safe_counts
+        weights[zero_mask] = 0.0
+        self.class_weights = weights
 
 
 def create_dataloaders(config: DatasetConfig) -> Tuple[DataLoader, DataLoader, Sequence[str]]:
@@ -177,11 +234,31 @@ def create_dataloaders(config: DatasetConfig) -> Tuple[DataLoader, DataLoader, S
     train_dataset = subset(train_indices, config.transform)
     val_dataset = subset(val_indices, config.val_transform)
 
+    sampler = None
+    sampler_generator = None
+    if config.use_weighted_sampler and getattr(train_dataset, "class_weights", None) is not None:
+        class_weights = np.asarray(train_dataset.class_weights, dtype=np.float64)
+        if class_weights.size == len(train_dataset.classes) and class_weights.sum() > 0:
+            class_weights = class_weights / (class_weights.sum() + 1e-8)
+            sample_labels = np.asarray(train_dataset.labels, dtype=np.int64)
+            sample_weights = class_weights[np.clip(sample_labels, 0, len(class_weights) - 1)]
+            sample_weights = np.clip(sample_weights, 1e-3, None)
+            sampler_generator = torch.Generator()
+            sampler_generator.manual_seed(config.seed)
+            sampler = WeightedRandomSampler(
+                weights=sample_weights.tolist(),
+                num_samples=len(sample_weights),
+                replacement=True,
+                generator=sampler_generator,
+            )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
-        shuffle=True,
+        shuffle=sampler is None,
         num_workers=config.num_workers,
+        sampler=sampler,
+        generator=sampler_generator,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -193,7 +270,7 @@ def create_dataloaders(config: DatasetConfig) -> Tuple[DataLoader, DataLoader, S
 
 
 if __name__ == "__main__":
-    config = DatasetConfig(root="~/data/diabetic_retinopathy", dataset_type="tanlikesmath")
+    config = DatasetConfig(root="/data/diabetic_retinopathy", dataset_type="tanlikesmath")
     train_loader, val_loader, classes = create_dataloaders(config)
     LOGGER.info("Number of classes: %d", len(classes))
     LOGGER.info("Classes: %s", classes)
