@@ -1,0 +1,41 @@
+{
+  "stages": [
+    {
+      "name": "quantum",
+      "num_epochs": 3,
+      "learning_rate": 0.0008,
+      "weight_decay": 0.0001,
+      "patience": 4,
+      "active_mask": [0, 0, 1],
+      "grad_accum_steps": 2,
+      "force_data_parallel": false,
+      "loss_weights": {
+        "classical_a": 0.0,
+        "classical_b": 0.0,
+        "quantum": 1.0,
+        "ensemble": 0.0
+      },
+      "annealing_schedule": {
+        "start_temp": 2.5,
+        "end_temp": 0.6,
+        "start_noise": 0.2,
+        "end_noise": 0.0,
+        "strategy": "cosine"
+      }
+    },
+    {
+      "name": "ensemble",
+      "num_epochs": 5,
+      "learning_rate": 0.0005,
+      "weight_decay": 0.0001,
+      "grad_accum_steps": 1,
+      "active_mask": [1, 1, 1],
+      "loss_weights": {
+        "classical_a": 0.5,
+        "classical_b": 0.5,
+        "quantum": 0.25,
+        "ensemble": 1.0
+      }
+    }
+  ]
+}

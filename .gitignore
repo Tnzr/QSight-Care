@@ -11,3 +11,9 @@ __pycache__/
 
 # Notebook checkpoints
 .ipynb_checkpoints/
+
+# Local configuration files
+config/*.local.json
+
+# W&B run artifacts
+wandb/

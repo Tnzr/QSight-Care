@@ -68,6 +68,10 @@ class DatasetConfig:
     transform: Optional[Callable] = None
     val_transform: Optional[Callable] = None
     use_weighted_sampler: bool = False
+    weighted_sampler_replacement: bool = False
+    weighted_sampler_min_weight: float = 1e-3
+    weighted_sampler_max_weight: Optional[float] = None
+    class_weight_exponent: float = 1.0
 
     def __post_init__(self) -> None:
         self.root = Path(self.root).expanduser().resolve()
@@ -93,6 +97,7 @@ class DiabeticRetinopathyDataset(Dataset):
         self.config = config
         self.mode = mode
         self.transform = transform or config.transform
+        self.class_weight_exponent = float(getattr(config, "class_weight_exponent", 1.0))
         if image_paths is not None and labels is not None and classes is not None:
             self.image_paths = list(map(Path, image_paths))
             self.labels = list(labels)
@@ -204,6 +209,13 @@ class DiabeticRetinopathyDataset(Dataset):
         safe_counts[zero_mask] = 1.0
         weights = (total / num_classes) / safe_counts
         weights[zero_mask] = 0.0
+        exponent = float(max(getattr(self, "class_weight_exponent", 1.0), 0.0))
+        if exponent and exponent != 1.0:
+            weights = np.power(weights, exponent)
+            weights = weights.astype(np.float64, copy=False)
+            weight_sum = weights.sum()
+            if weight_sum > 0:
+                weights = weights / (weight_sum / max(num_classes, 1))
         self.class_weights = weights
 
 
@@ -242,14 +254,31 @@ def create_dataloaders(config: DatasetConfig) -> Tuple[DataLoader, DataLoader, S
             class_weights = class_weights / (class_weights.sum() + 1e-8)
             sample_labels = np.asarray(train_dataset.labels, dtype=np.int64)
             sample_weights = class_weights[np.clip(sample_labels, 0, len(class_weights) - 1)]
-            sample_weights = np.clip(sample_weights, 1e-3, None)
+            min_weight = max(config.weighted_sampler_min_weight, 1e-6)
+            sample_weights = np.clip(sample_weights, min_weight, None)
+            if config.weighted_sampler_max_weight is not None:
+                max_weight = max(float(config.weighted_sampler_max_weight), min_weight)
+                sample_weights = np.minimum(sample_weights, max_weight)
+            sample_weights = sample_weights / (sample_weights.sum() + 1e-8)
             sampler_generator = torch.Generator()
             sampler_generator.manual_seed(config.seed)
+            num_samples = len(sample_weights)
             sampler = WeightedRandomSampler(
                 weights=sample_weights.tolist(),
-                num_samples=len(sample_weights),
-                replacement=True,
+                num_samples=num_samples,
+                replacement=bool(config.weighted_sampler_replacement),
                 generator=sampler_generator,
+            )
+            max_info = (
+                f", max_weight={float(config.weighted_sampler_max_weight):.4e}"
+                if config.weighted_sampler_max_weight is not None
+                else ""
+            )
+            LOGGER.info(
+                "Weighted sampler active (replacement=%s, min_weight=%.4e%s)",
+                config.weighted_sampler_replacement,
+                min_weight,
+                max_info,
             )
 
     train_loader = DataLoader(

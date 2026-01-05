@@ -20,6 +20,7 @@ try:  # pragma: no cover - allow script execution outside package context
     from .models import AER_IMPORT_ERROR, QISKIT_AER_AVAILABLE, QISKIT_AVAILABLE
     from .training import (
         StageConfig,
+        LossConfig,
         TrainingConfig,
         WandBConfig,
         default_stage_schedule,
@@ -31,6 +32,7 @@ except ImportError:
     from models import AER_IMPORT_ERROR, QISKIT_AER_AVAILABLE, QISKIT_AVAILABLE  # type: ignore
     from training import (  # type: ignore
         StageConfig,
+        LossConfig,
         TrainingConfig,
         WandBConfig,
         default_stage_schedule,
@@ -208,6 +210,9 @@ def _build_stage_configs(raw_stages: List[dict]) -> List[StageConfig]:
         lr_decay_factor = float(entry.get("lr_decay_factor", 0.5))
         min_lr = float(entry.get("min_lr", 1e-6))
         annealing_schedule = entry.get("annealing_schedule")
+        train_batch_size = entry.get("train_batch_size")
+        val_batch_size = entry.get("val_batch_size")
+        skip_ensemble = bool(entry.get("skip_ensemble", False))
         stages.append(
             StageConfig(
                 name=name,
@@ -225,6 +230,9 @@ def _build_stage_configs(raw_stages: List[dict]) -> List[StageConfig]:
                 lr_decay_factor=lr_decay_factor,
                 min_lr=min_lr,
                 annealing_schedule=annealing_schedule,
+                train_batch_size=int(train_batch_size) if train_batch_size else None,
+                val_batch_size=int(val_batch_size) if val_batch_size else None,
+                skip_ensemble=skip_ensemble,
             )
         )
     return stages
@@ -286,6 +294,10 @@ def parse_args() -> argparse.Namespace:
     if quant_defaults is None:
         quant_defaults = {}
 
+    loss_defaults = config_data.get("loss")
+    if not isinstance(loss_defaults, dict):
+        loss_defaults = {}
+
     config_stage_entries = config_data.get("stages")
     if config_stage_entries is not None and not isinstance(config_stage_entries, list):
         raise ValueError("Config field 'stages' must be a list of stage definitions")
@@ -318,6 +330,163 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=config_data.get("use_weighted_sampler", False),
         help="Enable weighted sampling to counter class imbalance",
+    )
+    parser.add_argument(
+        "--weighted-sampler-replacement",
+        action=argparse.BooleanOptionalAction,
+        default=config_data.get("weighted_sampler_replacement", False),
+        help="Allow the weighted sampler to draw samples with replacement",
+    )
+    parser.add_argument(
+        "--weighted-sampler-min-weight",
+        type=float,
+        default=config_data.get("weighted_sampler_min_weight", 1e-3),
+        help="Lower clamp applied to per-sample weights for the weighted sampler",
+    )
+    parser.add_argument(
+        "--weighted-sampler-max-weight",
+        type=float,
+        default=config_data.get("weighted_sampler_max_weight"),
+        help="Upper clamp applied to per-sample weights (omit to disable clamping)",
+    )
+    parser.add_argument(
+        "--class-weight-exponent",
+        type=float,
+        default=config_data.get("class_weight_exponent", 1.0),
+        help="Exponent applied to inverse-frequency class weights (values <1.0 temper extremes)",
+    )
+    parser.add_argument(
+        "--collapse-detection",
+        action=argparse.BooleanOptionalAction,
+        default=config_data.get("collapse_detection_enabled", True),
+        help="Enable automatic detection/reweighting when validation predictions collapse to a single class",
+    )
+    parser.add_argument(
+        "--collapse-threshold",
+        type=float,
+        default=config_data.get("collapse_threshold", 0.9),
+        help="Threshold on dominant validation class probability to flag collapse",
+    )
+    parser.add_argument(
+        "--collapse-patience",
+        type=int,
+        default=config_data.get("collapse_patience", 2),
+        help="Number of consecutive collapsed epochs before reweighting is applied",
+    )
+    parser.add_argument(
+        "--collapse-cooldown",
+        type=int,
+        default=config_data.get("collapse_cooldown", 1),
+        help="Cooldown epochs before another collapse adjustment may run",
+    )
+    parser.add_argument(
+        "--collapse-reweight-factor",
+        type=float,
+        default=config_data.get("collapse_reweight_factor", 0.5),
+        help="Multiplicative factor applied to the dominant class weight when collapse is detected",
+    )
+    parser.add_argument(
+        "--collapse-min-class-weight",
+        type=float,
+        default=config_data.get("collapse_min_class_weight", 0.05),
+        help="Lower bound enforced on class weights during collapse recovery",
+    )
+    parser.add_argument(
+        "--collapse-log-distributions",
+        action=argparse.BooleanOptionalAction,
+        default=config_data.get("collapse_log_distributions", True),
+        help="Stream per-class prediction/target ratios to W&B for diagnostics",
+    )
+    parser.add_argument(
+        "--collapse-entropy-weight",
+        type=float,
+        default=config_data.get("collapse_entropy_weight", 0.0),
+        help="Weight for enforcing a minimum entropy on the quantum head predictions",
+    )
+    parser.add_argument(
+        "--collapse-entropy-target",
+        type=float,
+        default=config_data.get("collapse_entropy_target", 1.2),
+        help="Target entropy threshold used by the quantum entropy penalty",
+    )
+    parser.add_argument(
+        "--collapse-distill-weight",
+        type=float,
+        default=config_data.get("collapse_distill_weight", 0.0),
+        help="Weight applied to the classical-to-quantum distillation penalty",
+    )
+    parser.add_argument(
+        "--collapse-distill-temperature",
+        type=float,
+        default=config_data.get("collapse_distill_temperature", 1.5),
+        help="Logit temperature used for the distillation penalty",
+    )
+    parser.add_argument(
+        "--loss-type",
+        type=str.lower,
+        default=str(loss_defaults.get("type", "class_balanced")).lower(),
+        choices=["cross_entropy", "class_balanced", "focal_class_balanced", "balanced"],
+        help="Loss objective to optimize",
+    )
+    parser.add_argument(
+        "--loss-focal-gamma",
+        type=float,
+        default=float(loss_defaults.get("focal_gamma", 2.0)),
+        help="Gamma hyperparameter for focal loss (only used for focal_class_balanced)",
+    )
+    parser.add_argument(
+        "--loss-cb-beta",
+        type=float,
+        default=float(loss_defaults.get("class_balanced_beta", 0.999)),
+        help="Class-balanced beta parameter (values near 1 emphasise rare classes)",
+    )
+    parser.add_argument(
+        "--auto-tune-batch-size",
+        action=argparse.BooleanOptionalAction,
+        default=config_data.get("auto_tune_batch_size", False),
+        help="Automatically search for the largest batch size that fits in GPU memory",
+    )
+    parser.add_argument(
+        "--batch-tuner-min-batch-size",
+        type=int,
+        default=config_data.get("batch_tuner_min_batch_size"),
+        help="Minimum batch size candidate for the GPU tuner (defaults to current batch size)",
+    )
+    parser.add_argument(
+        "--batch-tuner-max-batch-size",
+        type=int,
+        default=config_data.get("batch_tuner_max_batch_size"),
+        help="Upper bound on batch size candidates for the GPU tuner",
+    )
+    parser.add_argument(
+        "--batch-tuner-growth-factor",
+        type=float,
+        default=config_data.get("batch_tuner_growth_factor", 1.5),
+        help="Multiplicative growth factor applied between tuner trials",
+    )
+    parser.add_argument(
+        "--batch-tuner-target-utilization",
+        type=float,
+        default=config_data.get("batch_tuner_target_utilization", 0.9),
+        help="Desired fraction of GPU memory to utilize when tuning batch size",
+    )
+    parser.add_argument(
+        "--batch-tuner-max-latency-increase",
+        type=float,
+        default=config_data.get("batch_tuner_max_latency_increase", 1.3),
+        help="Maximum allowed multiplicative increase in step latency during tuning",
+    )
+    parser.add_argument(
+        "--batch-tuner-include-val",
+        action=argparse.BooleanOptionalAction,
+        default=config_data.get("batch_tuner_include_val", True),
+        help="Allow tuner to evaluate validation loader as well as training loader",
+    )
+    parser.add_argument(
+        "--batch-tuner-warmup-steps",
+        type=int,
+        default=config_data.get("batch_tuner_warmup_steps", 1),
+        help="Number of warmup steps to perform before measuring latency (reserved for future use)",
     )
     parser.add_argument(
         "--pretrained",
@@ -354,6 +523,13 @@ def parse_args() -> argparse.Namespace:
         help="Disable latency tracking (alias)",
     )
     parser.add_argument("--log-interval", type=int, default=config_data.get("log_interval", 25), help="Training log interval (batches)")
+    parser.add_argument(
+        "--log-level",
+        type=str.upper,
+        default=str(config_data.get("log_level", "INFO")).upper(),
+        choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"],
+        help="Logging verbosity",
+    )
     parser.add_argument(
         "--stages-config",
         type=Path,
@@ -429,6 +605,24 @@ def parse_args() -> argparse.Namespace:
         help="Optional directory to store per-stage checkpoints",
     )
     parser.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        default=None,
+        help="Preload model weights from a checkpoint before training",
+    )
+    parser.add_argument(
+        "--init-strict",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use strict weight loading for --init-checkpoint",
+    )
+    parser.add_argument(
+        "--init-restore-history",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Restore checkpoint training history when using --init-checkpoint",
+    )
+    parser.add_argument(
         "--use-wandb",
         action=argparse.BooleanOptionalAction,
         default=use_wandb_default,
@@ -464,10 +658,15 @@ def parse_args() -> argparse.Namespace:
         help="W&B logging mode",
     )
     args = parser.parse_args(remaining)
-    for attr in ["dataset_root", "output_dir", "stages_config", "checkpoint_dir"]:
+    for attr in ["dataset_root", "output_dir", "stages_config", "checkpoint_dir", "init_checkpoint"]:
         value = getattr(args, attr, None)
         if isinstance(value, Path):
             setattr(args, attr, value.expanduser())
+
+    if args.stages_config is not None:
+        args.config_stages = None
+    else:
+        args.config_stages = config_stage_entries
 
     if args.device_ids is None:
         config_device_ids = config_data.get("device_ids")
@@ -480,7 +679,6 @@ def parse_args() -> argparse.Namespace:
     else:
         args.device_ids = None
 
-    args.config_stages = config_stage_entries
     args.config_file = config_args.config_file
     args.quant_defaults = quant_defaults
     return args
@@ -488,6 +686,10 @@ def parse_args() -> argparse.Namespace:
 
 def load_stages_from_file(path: Path) -> List[StageConfig]:
     data = json.loads(path.read_text())
+    if isinstance(data, dict):
+        if "stages" not in data:
+            raise ValueError("Stage config dictionary must include a 'stages' key")
+        data = data["stages"]
     if not isinstance(data, list):
         raise ValueError(f"Stage config file must contain a list, found {type(data)!r}")
     return _build_stage_configs(data)
@@ -495,7 +697,13 @@ def load_stages_from_file(path: Path) -> List[StageConfig]:
 
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+    log_level_name = str(args.log_level).upper()
+    log_level = getattr(logging, log_level_name, logging.INFO)
+    logging.basicConfig(level=log_level, format=LOG_FORMAT)
+    if log_level <= logging.DEBUG:
+        logging.getLogger("matplotlib").setLevel(logging.WARNING)
+        logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
+        logging.getLogger("PIL").setLevel(logging.WARNING)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -509,6 +717,14 @@ def main() -> None:
         train_ratio=args.train_ratio,
         num_workers=args.num_workers,
         use_weighted_sampler=bool(args.weighted_sampler),
+        weighted_sampler_replacement=bool(args.weighted_sampler_replacement),
+        weighted_sampler_min_weight=max(1e-8, float(args.weighted_sampler_min_weight)),
+        weighted_sampler_max_weight=(
+            float(args.weighted_sampler_max_weight)
+            if args.weighted_sampler_max_weight is not None
+            else None
+        ),
+        class_weight_exponent=max(0.0, float(args.class_weight_exponent)),
     )
     train_loader, val_loader, classes = create_dataloaders(dataset_config)
     if args.config_stages:
@@ -560,6 +776,14 @@ def main() -> None:
         )
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    selected_loss_type = args.loss_type
+    if selected_loss_type == "balanced":
+        selected_loss_type = "class_balanced"
+    loss_config = LossConfig(
+        type=selected_loss_type,
+        focal_gamma=float(args.loss_focal_gamma),
+        class_balanced_beta=float(args.loss_cb_beta),
+    )
     training_config = TrainingConfig(
         stages=stages,
         device=device,
@@ -572,9 +796,51 @@ def main() -> None:
         data_parallel=args.multi_gpu,
         device_ids=args.device_ids,
         quantization=quantization_config,
+        collapse_detection_enabled=bool(args.collapse_detection),
+        collapse_threshold=float(args.collapse_threshold),
+        collapse_patience=max(1, int(args.collapse_patience)),
+        collapse_cooldown=max(0, int(args.collapse_cooldown)),
+        collapse_reweight_factor=float(args.collapse_reweight_factor),
+        collapse_min_class_weight=float(args.collapse_min_class_weight),
+        collapse_log_distributions=bool(args.collapse_log_distributions),
+        collapse_entropy_weight=float(args.collapse_entropy_weight),
+        collapse_entropy_target=float(args.collapse_entropy_target),
+        collapse_distill_weight=float(args.collapse_distill_weight),
+        collapse_distill_temperature=float(args.collapse_distill_temperature),
+        auto_tune_batch_size=bool(args.auto_tune_batch_size),
+        batch_tuner_min_batch_size=(
+            int(args.batch_tuner_min_batch_size)
+            if args.batch_tuner_min_batch_size is not None
+            else None
+        ),
+        batch_tuner_max_batch_size=(
+            int(args.batch_tuner_max_batch_size)
+            if args.batch_tuner_max_batch_size is not None
+            else None
+        ),
+        batch_tuner_growth_factor=float(args.batch_tuner_growth_factor),
+        batch_tuner_target_utilization=float(args.batch_tuner_target_utilization),
+        batch_tuner_max_latency_increase=float(args.batch_tuner_max_latency_increase),
+        batch_tuner_include_val=bool(args.batch_tuner_include_val),
+        batch_tuner_warmup_steps=max(0, int(args.batch_tuner_warmup_steps)),
+        loss=loss_config,
     )
 
     log_environment_diagnostics(args, device, use_mixed_precision, quantization_config)
+
+    if loss_config.type == "focal_class_balanced":
+        LOGGER.info(
+            "Using focal class-balanced loss (gamma=%.3f, beta=%.6f)",
+            loss_config.focal_gamma,
+            loss_config.class_balanced_beta,
+        )
+    elif loss_config.type == "class_balanced":
+        LOGGER.info(
+            "Using class-balanced cross entropy (beta=%.6f)",
+            loss_config.class_balanced_beta,
+        )
+    else:
+        LOGGER.info("Using cross entropy loss")
 
     train_hybrid_model(
         train_loader,
@@ -587,6 +853,9 @@ def main() -> None:
         quantum_enabled=quantum_enabled,
         quantum_qubits=args.quantum_qubits,
         quantum_shots=args.quantum_shots,
+        init_checkpoint=args.init_checkpoint,
+        init_strict=bool(args.init_strict),
+        restore_history=bool(args.init_restore_history),
     )
 
 

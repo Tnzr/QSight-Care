@@ -341,7 +341,16 @@ class QuantumClassificationHead(nn.Module):
         self.num_qubits = num_qubits
         self.num_classes = num_classes
         self.q_device = torch.device("cpu")
+        self.input_norm = nn.LayerNorm(input_dim)
         self.input_projection = nn.Linear(input_dim, num_qubits)
+        self.residual_mlp = nn.Sequential(
+            nn.Linear(input_dim, input_dim * 2),
+            nn.GELU(),
+            nn.LayerNorm(input_dim * 2),
+            nn.Linear(input_dim * 2, num_classes),
+        )
+        self._quantum_scale = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self._residual_scale = nn.Parameter(torch.tensor(-2.0, dtype=torch.float32))
         feature_map = ZZFeatureMap(num_qubits, reps=2)
         ansatz = RealAmplitudes(num_qubits, reps=2)
         circuit = feature_map.compose(ansatz)
@@ -407,7 +416,8 @@ class QuantumClassificationHead(nn.Module):
         self.register_buffer("noise_scale", torch.tensor(0.0, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        projected = self.input_projection(x)
+        normalized = self.input_norm(x)
+        projected = self.input_projection(normalized)
         temperature = self.temperature.to(projected.device)
         scaled = projected / temperature.clamp_min(1e-3)
         if self.training and float(self.noise_scale.item()) > 0.0:
@@ -418,7 +428,11 @@ class QuantumClassificationHead(nn.Module):
             quantum_raw = self.q_layer(projected_cpu)
         quantum_raw = quantum_raw.to(dtype=torch.float32)
         quantum_raw = quantum_raw.to(projected.device)
-        logits = self.post_process(quantum_raw)
+        quantum_logits = self.post_process(quantum_raw)
+        residual_logits = self.residual_mlp(normalized)
+        quantum_scale = torch.sigmoid(self._quantum_scale)
+        residual_scale = torch.sigmoid(self._residual_scale)
+        logits = quantum_scale * quantum_logits + residual_scale * residual_logits
         return logits
 
     def set_annealing_params(self, temperature: float, noise_scale: float = 0.0) -> None:
@@ -431,12 +445,43 @@ class QuantumClassificationHead(nn.Module):
         return float(self.temperature.item()), float(self.noise_scale.item())
 
 
-class DynamicEnsemble(nn.Module):
-    def __init__(self, num_heads: int = 3, init_temp: float = 1.0) -> None:
+class MLPEnsemble(nn.Module):
+    def __init__(
+        self,
+        num_heads: int = 3,
+        num_classes: int = 5,
+        hidden_dim: int = 256,
+        cost_scale: float = 0.1,
+    ) -> None:
         super().__init__()
-        self.base_weights = nn.Parameter(torch.ones(num_heads) / num_heads)
-        self.temperature = nn.Parameter(torch.tensor(init_temp))
-        self.uncertainty_scales = nn.Parameter(torch.ones(num_heads))
+        self.num_heads = num_heads
+        self.num_classes = num_classes
+        feature_dim = num_heads * num_classes + num_heads * 2
+        mid_dim = max(hidden_dim // 2, num_classes * 2)
+        self.input_norm = nn.LayerNorm(feature_dim)
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, mid_dim),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.LayerNorm(mid_dim),
+        )
+        self.correction_head = nn.Linear(mid_dim, num_classes)
+        self.gating_layer = nn.Linear(feature_dim, num_heads)
+        self._cost_scale = nn.Parameter(torch.tensor(cost_scale, dtype=torch.float32))
+        self.register_buffer("class_indices", torch.arange(num_classes, dtype=torch.float32), persistent=False)
+        self._distance_scale = nn.Parameter(torch.tensor(0.7, dtype=torch.float32))
+        self._correction_scale = nn.Parameter(torch.tensor(0.15, dtype=torch.float32))
+        self._threshold_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+        # Learns per-class offsets based on neighbor probabilities to capture soft thresholds.
+        self.threshold_mlp = nn.Sequential(
+            nn.Linear(3, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+        )
 
     def forward(
         self,
@@ -444,48 +489,79 @@ class DynamicEnsemble(nn.Module):
         uncertainties: Optional[torch.Tensor] = None,
         active_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if active_mask is None:
-            mask = torch.ones(len(head_outputs), device=head_outputs[0].device)
+        if not head_outputs:
+            raise ValueError("head_outputs must contain tensors for each active head")
+        device = head_outputs[0].device
+        mask = torch.ones(len(head_outputs), device=device) if active_mask is None else active_mask.to(device).float()
+        mask = mask.clamp(min=0.0, max=1.0)
+
+        logits_stack = torch.stack(head_outputs, dim=1)  # (batch, heads, classes)
+        flattened_logits = logits_stack.reshape(logits_stack.shape[0], -1)
+        probs_stack = torch.softmax(logits_stack, dim=2)
+        confidences = probs_stack.max(dim=2).values
+        if uncertainties is not None:
+            uncertainty_tensor = uncertainties.to(device)
+            if uncertainty_tensor.dim() == 1:
+                uncertainty_tensor = uncertainty_tensor.unsqueeze(0)
+            if uncertainty_tensor.shape[0] == 1:
+                uncertainty_tensor = uncertainty_tensor.expand(logits_stack.shape[0], -1)
         else:
-            mask = active_mask.to(head_outputs[0].device).float()
-        weights = F.softmax(self.base_weights / self.temperature, dim=0)
-        weights = weights * mask
-        if weights.sum() <= 0:
-            weights = torch.ones_like(weights) * mask
-        weights = weights / (weights.sum() + 1e-8)
+            uncertainty_tensor = torch.zeros((logits_stack.shape[0], self.num_heads), device=device, dtype=flattened_logits.dtype)
+        features = torch.cat([flattened_logits, confidences, uncertainty_tensor], dim=1)
 
-        if uncertainties is not None and self.training:
-            if uncertainties.dim() == 1:
-                uncertainties = uncertainties.unsqueeze(0)
-            scaled_uncertainties = uncertainties * self.uncertainty_scales.unsqueeze(0)
-            confidence = 1.0 / (scaled_uncertainties + 1e-8)
-            batch_confidence = confidence.mean(dim=0)
-            confidence_weights = F.softmax(batch_confidence, dim=0)
-            with torch.no_grad():
-                predictions = torch.stack([torch.argmax(out, dim=1) for out in head_outputs], dim=1)
-                predictions_float = predictions.float()
-                max_vals, _ = predictions_float.max(dim=1)
-                min_vals, _ = predictions_float.min(dim=1)
-                agreement_mask = (max_vals == min_vals).float()
-                agreement = agreement_mask.mean()
-            uncertainty_weight = 0.7 * (1 - agreement) + 0.3
-            weights = (1 - uncertainty_weight) * weights + uncertainty_weight * confidence_weights
+        normed_features = self.input_norm(features)
+        hidden = self.feature_extractor(normed_features)
+        correction_logits = torch.tanh(self.correction_head(hidden))
 
-        weights = weights * mask
-        if weights.sum() <= 0:
-            weights = mask / (mask.sum() + 1e-8)
-        weights = weights / (weights.sum() + 1e-8)
+        avg_prob = probs_stack.mean(dim=1)
+        indices = self.class_indices.to(device, dtype=avg_prob.dtype)
+        distances = torch.abs(indices.unsqueeze(0) - indices.unsqueeze(1))
+        beta = F.softplus(self._distance_scale)
+        cost_matrix = torch.expm1(distances * beta)
+        penalty = avg_prob @ cost_matrix
+        expected_penalty = (penalty * avg_prob).sum(dim=1, keepdim=True)
+        penalty = penalty - expected_penalty
+        top_indices = avg_prob.argmax(dim=1, keepdim=True)
+        neighbor_mask = torch.zeros_like(avg_prob)
+        neighbor_mask.scatter_(1, top_indices, 1.0)
+        left_indices = (top_indices - 1).clamp_min(0)
+        right_indices = (top_indices + 1).clamp_max(self.num_classes - 1)
+        neighbor_mask.scatter_(1, left_indices, 1.0)
+        neighbor_mask.scatter_(1, right_indices, 1.0)
+        penalty = penalty * (1.0 - neighbor_mask)
+        penalty = torch.clamp(penalty, min=0.0)
+        peak_confidence = probs_stack.max(dim=2).values.mean(dim=1, keepdim=True)
+        penalty = penalty * peak_confidence
+        penalty = torch.clamp(penalty, max=1.5)
+        cost_scale = F.softplus(self._cost_scale)
+        neighbor_left = torch.roll(avg_prob, shifts=1, dims=1)
+        neighbor_right = torch.roll(avg_prob, shifts=-1, dims=1)
+        neighbor_left[:, 0] = 0.0
+        neighbor_right[:, -1] = 0.0
+        # Compose [prev, self, next] probabilities for each class.
+        neighbor_features = torch.stack([neighbor_left, avg_prob, neighbor_right], dim=-1)
+        threshold_offsets = torch.tanh(self.threshold_mlp(neighbor_features)).squeeze(-1)
+        # Emphasise offsets for the dominant class and its immediate neighbours.
+        threshold_weight = 0.25 + 0.75 * neighbor_mask
 
-        if not self.training:
-            weights = weights.detach()
+        raw_gates = self.gating_layer(normed_features)
+        if mask.numel() == raw_gates.shape[1]:
+            mask_view = mask.view(1, -1)
+            fill_value = torch.finfo(raw_gates.dtype).min
+            raw_gates = raw_gates.masked_fill(mask_view <= 0, fill_value)
+        gate_weights = torch.softmax(raw_gates, dim=1)
+        if torch.isnan(gate_weights).any():
+            uniform = torch.ones_like(gate_weights) / max(1, gate_weights.shape[1])
+            gate_weights = uniform
 
-        final_output = None
-        for idx, (weight, out) in enumerate(zip(weights, head_outputs)):
-            if mask[idx] > 0:
-                final_output = out * weight if final_output is None else final_output + weight * out
-        if final_output is None:
-            final_output = head_outputs[0]
-        return final_output, weights
+        gated_logits = torch.sum(gate_weights.unsqueeze(-1) * logits_stack, dim=1)
+        correction_scale = torch.sigmoid(self._correction_scale)
+        threshold_scale = torch.sigmoid(self._threshold_scale)
+        base_logits = gated_logits + correction_scale * correction_logits
+        adjusted_logits = base_logits - cost_scale * penalty + threshold_scale * threshold_offsets * threshold_weight
+
+        batch_weights = gate_weights.mean(dim=0)
+        return adjusted_logits, batch_weights
 
 
 @dataclass
@@ -540,14 +616,13 @@ class ClassicalDRModel(nn.Module):
             )
         else:
             self.quantum_head = None
-        self.ensemble = DynamicEnsemble(num_heads=3)
+        self.ensemble = MLPEnsemble(num_heads=3, num_classes=num_classes)
         self.head_order = ["classical_a", "classical_b", "quantum"]
         self._latency_tracking = False
         self._active_mask: Optional[List[float]] = None
 
     def enable_latency_tracking(self, enabled: bool = True) -> None:
         self._latency_tracking = enabled
-
     def set_active_mask(self, mask: Optional[Iterable[float]]) -> None:
         if mask is None:
             self._active_mask = None
@@ -563,6 +638,7 @@ class ClassicalDRModel(nn.Module):
         return_all: bool = True,
         active_mask: Optional[torch.Tensor] = None,
         track_latency: Optional[bool] = None,
+        skip_ensemble: bool = False,
     ) -> ModelForwardOutput | torch.Tensor:
         if track_latency is not None:
             self._latency_tracking = track_latency
@@ -623,8 +699,20 @@ class ClassicalDRModel(nn.Module):
                 device=x.device,
             )
 
-        final_output, ensemble_weights = self.ensemble(head_outputs, uncertainties, active_mask=mask_tensor)
-        latencies.setdefault("ensemble", 0.0)
+        if skip_ensemble:
+            ensemble_weights = torch.zeros(len(head_outputs), device=x.device, dtype=head_outputs[0].dtype)
+            active_indices: List[int] = []
+            if mask_tensor is not None:
+                active_indices = [idx for idx in range(min(len(head_outputs), mask_tensor.numel())) if mask_tensor[idx] > 0]
+            if not active_indices:
+                active_indices = [0]
+            primary_idx = active_indices[0]
+            ensemble_weights[primary_idx] = 1.0
+            final_output = head_outputs[primary_idx]
+            latencies.setdefault("ensemble", 0.0)
+        else:
+            final_output, ensemble_weights = self.ensemble(head_outputs, uncertainties, active_mask=mask_tensor)
+            latencies.setdefault("ensemble", 0.0)
 
         latency_values = [float(latencies.get(key, 0.0)) for key in LATENCY_KEYS]
         latency_tensor = torch.tensor(latency_values, device=x.device, dtype=torch.float32)
@@ -712,6 +800,20 @@ class ClassicalDRModel(nn.Module):
             self._set_requires_grad(self.classical_head_b, True)
             self._set_requires_grad(self.quantum_head, False)
             self._set_requires_grad(self.ensemble, True)
+        elif stage == "head_a":
+            self._set_requires_grad(self.vision_encoder, True)
+            self._set_requires_grad(self.compression, False)
+            self._set_requires_grad(self.classical_head_a, True)
+            self._set_requires_grad(self.classical_head_b, False)
+            self._set_requires_grad(self.quantum_head, False)
+            self._set_requires_grad(self.ensemble, False)
+        elif stage == "head_b":
+            self._set_requires_grad(self.vision_encoder, False)
+            self._set_requires_grad(self.compression, True)
+            self._set_requires_grad(self.classical_head_a, False)
+            self._set_requires_grad(self.classical_head_b, True)
+            self._set_requires_grad(self.quantum_head, False)
+            self._set_requires_grad(self.ensemble, False)
         elif stage == "quantum":
             self._set_requires_grad(self.vision_encoder, False)
             self._set_requires_grad(self.compression, False)
@@ -748,7 +850,7 @@ __all__ = [
     "ClassicalHeadA",
     "ClassicalHeadB",
     "QuantumClassificationHead",
-    "DynamicEnsemble",
+    "MLPEnsemble",
     "ModelForwardOutput",
     "ClassicalDRModel",
     "QISKIT_AVAILABLE",

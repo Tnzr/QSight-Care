@@ -15,6 +15,7 @@
 - **Height:** 172 cm
 - **Weight:** 86 kg (BMI ≈ 29.1)
 - **Comorbidities:**
+Obesity: At Risk (BMI in overweight range)
   - Obesity: At Risk (BMI in overweight range)
   - Insulin Usage: Yes (basal-bolus regimen)
   - Smoking: Former smoker (quit 5 years ago)
